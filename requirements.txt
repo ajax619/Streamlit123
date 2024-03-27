@@ -2,5 +2,4 @@ streamlit
 numpy
 pandas
 camelot
-base64
 PyPDF2<3.0
