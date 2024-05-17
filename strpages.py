@@ -1,157 +1,133 @@
-import numpy as np
 import streamlit as st
-import base64
-import camelot as cam
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.formrecognizer import DocumentAnalysisClient
 import pandas as pd
-from io import BytesIO
 import re
+import io
+import base64
 
-
-
-st.set_page_config(layout="wide", initial_sidebar_state="expanded", page_title="Bank Statement Table Extractor", page_icon=None)
-
-st.title("Bank Statement Table Extractor")
-st.subheader("")
-
-input_pdf = st.file_uploader(label="Upload your pdf here", type='pdf')
-
-st.markdown("### Page Number")
-
-page_numbers_input = st.text_input("Enter the page numbers separated by commas (e.g., 1, 3, 5)", value="1")
-
-st.markdown("### Tweaking")
-rowtol = st.number_input("Enter row tweaking parameter : ", value=5.00)
-
-coltol = st.number_input("Enter column tweaking parameter : ", value=1.00)
-
-edgetol = st.number_input("Enter egde tweaking parameter : ", value=50.00)
-
-# Preprocessing options
- 
-preprocess_type = st.selectbox("Select Preprocessing Type", ["Type 1", "Barclays", "HSBC1", "HSBC2" ,"Type5","Type6"])  
-
-def extract_tables_from_pages(pages):
-    all_tables = []
-    for page_num in pages:
-        tables = cam.read_pdf("input.pdf", pages=str(page_num), flavor='stream', split_text=True, row_tol=rowtol, column_tol=coltol, edge_tol=edgetol)
-        all_tables.extend(tables)
-    return all_tables
-
-def preprocess_data(df, preprocess_type):
-    if preprocess_type == "Type 1":
-        pass
-    elif preprocess_type == "Barclays":
-        indices_to_check = [0, 2, 3, 4]
-        last_non_empty_row = None
-        if 3 >= len(df.columns):
-            return df
-
-        for index, row in df.iterrows():
-            if all(row[i] == '' or pd.isnull(row[i]) for i in indices_to_check):
-                if last_non_empty_row is not None:
-                    # Convert the cell value to string explicitly
-                    df.at[last_non_empty_row, 1] = str(df.at[last_non_empty_row, 1]) + ' ' + str(row[1])
-                    # Clear the current row
-                    df.iloc[index] = None
-
-            else:
-                last_non_empty_row = index
-        # Remove rows where all columns in indices_to_check are empty
-        df = df.dropna(subset=[df.columns[i] for i in indices_to_check if i < len(df.columns)], how='all')
-        df.iloc[:, 0] = df.iloc[:, 0].mask(df.iloc[:, 0] == '').ffill()
-        return df
-    elif preprocess_type == "HSBC1":
-        def extract_and_remove_date(cell):
-            # Convert cell to string (if it's not already)
-            cell = str(cell)
-            
-            match = re.search(r'\b(\d+\s\w+\s\d+)\b', cell)
-            if match:
-                date = match.group(1)
-                cell = cell.replace(date, '').strip()
-                return date, cell
-            return None, cell
-
-        # Extracting date and modifying original column
-        df['Dates'], df[df.columns[0]] = zip(*df[df.columns[0]].apply(extract_and_remove_date))
-        # Reordering columns directly
-        df = df[['Dates'] + [col for col in df.columns if col != 'Dates']]
-        df = df.reset_index(drop=True)
-        rows_to_remove = []
-
-        for i in range(1, len(df)):
-            # Check if the cell at index 0 and 1 in the current row is either an empty string, None, or contains only spaces
-            if (df.iloc[i, 0] is None or str(df.iloc[i, 0]).strip() == '') and (df.iloc[i, 1] is None or str(df.iloc[i, 1]).strip() == ''):
-                # Check if the corresponding cells in the previous row are not empty strings or spaces or None
-                if (df.iloc[i - 1, 0] is not None and str(df.iloc[i - 1, 0]).strip() != '') or (df.iloc[i - 1, 1] is not None and str(df.iloc[i - 1, 1]).strip() != ''):
-                    # Join current row's data with the preceding row's data
-                    for col in range(len(df.columns)):
-                        if df.iloc[i, col] is not None and str(df.iloc[i, col]).strip() != '':
-                            # Joining data with a space
-                            df.iloc[i - 1, col] = str(df.iloc[i - 1, col]).strip() + " " + str(df.iloc[i, col]).strip()
-                    # Mark the current row for removal
-                    rows_to_remove.append(i)
-
-        # Remove marked rows
-        df = df.drop(rows_to_remove).reset_index(drop=True)
-        df.iloc[:, 0] = df.iloc[:, 0].mask(df.iloc[:, 0] == '').ffill()
-
-    elif preprocess_type == "HSBC2":
-        rows_to_remove = []
-
-        for i in range(1, len(df)):
-
-            if (df.iloc[i, 0] is None or str(df.iloc[i, 0]).strip() == '') and (df.iloc[i, 1] is None or str(df.iloc[i, 1]).strip() == ''):
-                if (df.iloc[i - 1, 0] is not None and str(df.iloc[i - 1, 0]).strip() != '') or (df.iloc[i - 1, 1] is not None and str(df.iloc[i - 1, 1]).strip() != ''):
-                    for col in range(len(df.columns)):
-                        if df.iloc[i, col] is not None and str(df.iloc[i, col]).strip() != '':
-                            df.iloc[i - 1, col] = str(df.iloc[i - 1, col]).strip() + " " + str(df.iloc[i, col]).strip()
-                    rows_to_remove.append(i)
-
-        # Remove marked rows
-        df = df.drop(rows_to_remove).reset_index(drop=True)
-        df.iloc[:, 0] = df.iloc[:, 0].mask(df.iloc[:, 0] == '').ffill()
-    elif preprocess_type == "Type5":
-        pass
-    elif preprocess_type == "Type6":
-        pass        
+def process_empty_rows(df):
+    # Function to process empty rows in a DataFrame
+    indices_to_check = [0, 2, 3, 4]
+    last_non_empty_row = None
+    for index, row in df.iterrows():
+        if all(df.columns[i] in row and (pd.isna(row[i]) or row[i] == '') for i in indices_to_check):
+            if last_non_empty_row is not None and df.columns[1] in df:
+                if not pd.isna(df.at[last_non_empty_row, df.columns[1]]) and not pd.isna(row[df.columns[1]]):
+                    df.at[last_non_empty_row, df.columns[1]] = str(df.at[last_non_empty_row, df.columns[1]]) + ' ' + str(row[df.columns[1]])
+                df = df.drop(index)
+        else:
+            last_non_empty_row = index
+    df = df.dropna(subset=[df.columns[i] for i in indices_to_check if i < len(df.columns)], how='all')
+    df.iloc[:, 0] = df.iloc[:, 0].mask(df.iloc[:, 0] == '').ffill()
+    df.iloc[:, 0] = df.iloc[:, 0].str.replace('  ', ' ')
+    df.iloc[:, 0] = df.iloc[:, 0].apply(lambda s: re.sub(r'(\d)\s(\d)', r'\1\2', s) if isinstance(s, str) else s)
     return df
 
+def separate_date_description(row):
+    # Function to separate date and description in a DataFrame row
+    cell = row['Date']
+    description = row['Descriptions']
+    
+    if isinstance(cell, str):
+        match = re.match(r'(\d{1,2} \w+)', cell)
+        if match:
+            date = match.group(1)
+            if not description:
+                description = cell[len(date):].strip()
+            return pd.Series([date, description])
+    
+    return pd.Series([cell, description])
 
-def get_table_download_link(df, uploaded_filename):
-    output = BytesIO()
-    df.to_excel(output, sheet_name='table', index=False)
-    excel_data = output.getvalue()
-    b64 = base64.b64encode(excel_data).decode()
-    href = f'<a href="data:application/octet-stream;base64,{b64}" download="{uploaded_filename}.xlsx">Download Excel File</a>'
+def process_pdf_and_get_dataframe(file_path):
+    # Function to process the uploaded PDF and return the combined DataFrame
+    endpoint = "https://ao-document-intelligence.cognitiveservices.azure.com/"
+    key = "d66dc755d5e44a4caca99b434831ca99"
+    
+    document_analysis_client = DocumentAnalysisClient(endpoint=endpoint, credential=AzureKeyCredential(key))
+    
+    with open(file_path, "rb") as f:
+        poller = document_analysis_client.begin_analyze_document("prebuilt-document", f.read())
+        result = poller.result()
+    
+    tables_data = []
+    
+    if result.tables:
+        for table in result.tables:
+            if table.column_count > 3:
+                data = []
+                for row_idx in range(table.row_count):
+                    row_data = []
+                    skip_row = False
+                    for column_idx in range(table.column_count):
+                        cell = [cell for cell in table.cells if cell.row_index == row_idx and cell.column_index == column_idx]
+                        if cell:
+                            cell_content = cell[0].content.strip()
+                            cell_content = cell_content.replace("1)", "").replace(")))", "").replace("%", "").replace("", "").replace(":unselected:", "").replace(":selected:", "").replace("=", "").replace("- ", "")
+                            if "Balance carried forward" in cell_content or \
+                               "Start Balance" in cell_content or \
+                               "brought forward" in cell_content or \
+                               "carried forward" in cell_content or \
+                               "Continued" in cell_content or \
+                               "Balance brought forward" in cell_content or \
+                               "Payments/Receipts" in cell_content:
+                                skip_row = True
+                                break
+                            else:
+                                row_data.append(cell_content)
+                        else:
+                            row_data.append(None)
+    
+                    if not skip_row:
+                        data.append(row_data)
+    
+                if data:
+                    df = pd.DataFrame(data[1:], columns=data[0])
+                    df = df.dropna(how='all')
+                    df = df.rename(columns={df.columns[0]: 'Date', 
+                                            df.columns[-1]: 'Balance £', 
+                                            df.columns[-2]: 'Money in £', 
+                                            df.columns[-3]: 'Money out £'})
+                    df['Descriptions'] = df.iloc[:, 1:-3].apply(lambda x: ' '.join(x.dropna().astype(str)), axis=1)
+                    cols=["Date", "Descriptions", "Money out £", "Money in £", "Balance £"]
+                    df = df[cols]
+                    df = process_empty_rows(df)
+                    df[['Date', 'Descriptions']] = df.apply(separate_date_description, axis=1)
+                    if len(df.columns) != 5:
+                        continue
+                    tables_data.append(df)
+    
+    combined_df = pd.concat(tables_data, ignore_index=True)
+    return combined_df
+
+def get_table_download_link(df, filename):
+    # Function to generate a download link for the DataFrame as an Excel file with the original filename
+    excel_buffer = io.BytesIO()
+    df.to_excel(excel_buffer, index=False)
+    excel_buffer.seek(0)
+    excel_binary = excel_buffer.getvalue()
+    excel_base64 = base64.b64encode(excel_binary).decode()
+    href = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{excel_base64}" download="{filename}.xlsx">Download Excel file</a>'
     return href
 
 
-if input_pdf is not None:
-    uploaded_filename = input_pdf.name.split('.')[0]  # Extracting the filename without extension
-    with open("input.pdf", "wb") as f:
-        f.write(input_pdf.read())
+# Streamlit App
+st.set_page_config(layout="wide", initial_sidebar_state="expanded", page_title="Bank Statement Table Extractor", page_icon=None)
+st.title("PDF Document Analyzer")
 
-    # selected_page_numbers = [int(page.strip()) for page in page_numbers_input.split(',')]
-    selected_page_numbers = [int(page.strip()) for page in page_numbers_input.split(',') if page.strip()]
+uploaded_file = st.file_uploader("Upload a PDF file", type="pdf")
 
+if uploaded_file is not None:
+    # Save the uploaded file temporarily
+    with open("temp.pdf", "wb") as f:
+        f.write(uploaded_file.getvalue())
 
-    all_extracted_tables = extract_tables_from_pages(selected_page_numbers)
+    st.text("Processing the uploaded PDF...")
+    combined_df = process_pdf_and_get_dataframe("temp.pdf")
 
-    st.markdown("### Number of Tables")
-    st.write(len(all_extracted_tables))
+    st.subheader("Combined DataFrame from PDF:")
+    st.data_editor(combined_df, use_container_width=True)
 
-    if len(all_extracted_tables) > 0:
-        st.markdown('### Output Table')
-
-        # Combine all tables from multiple pages into one DataFrame
-        combined_df = pd.concat([table.df for table in all_extracted_tables], ignore_index=True)
-
-        preprocessed_combined_df = preprocess_data(combined_df, preprocess_type)
-
-        edited_df = st.data_editor(preprocessed_combined_df, use_container_width=True)
-        
-        download_link = get_table_download_link(preprocessed_combined_df, uploaded_filename)
-        st.markdown(download_link, unsafe_allow_html=True)
-     
+    # Download Button for Excel
+    st.markdown(get_table_download_link(combined_df, uploaded_file.name), unsafe_allow_html=True)
 
