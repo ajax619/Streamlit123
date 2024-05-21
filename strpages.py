@@ -84,6 +84,20 @@ def process_pdf_and_get_dataframe(file_path):
                 if data:
                     df = pd.DataFrame(data[1:], columns=data[0])
                     df = df.dropna(how='all')
+                    second_last_col_name = df.columns[-2]
+                    if "Money in £" not in second_last_col_name:
+                        last_col_name = df.columns[-1]
+
+                        # Merge the last and second last columns
+                        df[last_col_name] = df.iloc[:, -2].fillna('') + " " + df.iloc[:, -1].fillna('')
+                        df[last_col_name] = df[last_col_name].str.strip()
+
+                        # Drop the second last column
+                        df.drop(df.columns[-2], axis=1, inplace=True)
+
+                        # Rename the merged column
+                        df.rename(columns={df.columns[-1]: last_col_name}, inplace=True)                    
+
                     df = df.rename(columns={df.columns[0]: 'Date', 
                                             df.columns[-1]: 'Balance £', 
                                             df.columns[-2]: 'Money in £', 
